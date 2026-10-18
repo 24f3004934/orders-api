@@ -6,7 +6,9 @@ import math
 import os
 import time
 import uuid
+from pathlib import Path
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -22,21 +24,9 @@ TOTAL_ORDERS = 52
 RATE_LIMIT = 17
 WINDOW_SECONDS = 10
 
-app = FastAPI(
-    title="Orders API",
-    version="1.0.0",
-)
-
-# ---------------------------------------
-# Redis Connection
-# ---------------------------------------
-
-from pathlib import Path
-from dotenv import load_dotenv
-
 load_dotenv(
     dotenv_path=Path(__file__).resolve().parent / ".env",
-    override=True,
+    override=False,
 )
 
 redis_url = os.getenv("UPSTASH_REDIS_REST_URL")
@@ -45,7 +35,7 @@ redis_token = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 if not redis_url or not redis_token:
     raise RuntimeError(
         "Missing UPSTASH_REDIS_REST_URL or "
-        "UPSTASH_REDIS_REST_TOKEN environment variable"
+        "UPSTASH_REDIS_REST_TOKEN"
     )
 
 db = Redis(
@@ -53,18 +43,16 @@ db = Redis(
     token=redis_token,
 )
 
+
 # ---------------------------------------
-# CORS
+# FastAPI Application
 # ---------------------------------------
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["Retry-After"],
+api = FastAPI(
+    title="Orders API",
+    version="1.0.1",
 )
+
 
 # ---------------------------------------
 # Fixed Catalog
@@ -79,8 +67,9 @@ ORDERS = [
     for i in range(1, TOTAL_ORDERS + 1)
 ]
 
+
 # ---------------------------------------
-# Request Model
+# Order Request Model
 # ---------------------------------------
 
 class OrderRequest(BaseModel):
@@ -89,7 +78,7 @@ class OrderRequest(BaseModel):
 
 
 # ---------------------------------------
-# Atomic Redis Rate Limiting
+# Atomic Sliding-Window Rate Limiter
 # ---------------------------------------
 
 RATE_SCRIPT = """
@@ -140,12 +129,12 @@ return {1, 0}
 """
 
 
-@app.middleware("http")
+@api.middleware("http")
 async def rate_limit_middleware(
     request: Request,
     call_next,
 ):
-    # CORS preflight requests are not counted.
+    # Browser preflight must not consume rate limit.
     if request.method == "OPTIONS":
         return await call_next(request)
 
@@ -155,26 +144,37 @@ async def rate_limit_middleware(
     )
 
     client_hash = hashlib.sha256(
-        client_id.encode()
+        client_id.encode("utf-8")
     ).hexdigest()
 
     redis_key = f"orders:rate:{client_hash}"
 
     now = int(time.time() * 1000)
 
-    result = db.eval(
-        RATE_SCRIPT,
-        keys=[redis_key],
-        args=[
-            now,
-            WINDOW_SECONDS * 1000,
-            RATE_LIMIT,
-            str(uuid.uuid4()),
-        ],
-    )
+    try:
+        result = db.eval(
+            RATE_SCRIPT,
+            keys=[redis_key],
+            args=[
+                now,
+                WINDOW_SECONDS * 1000,
+                RATE_LIMIT,
+                str(uuid.uuid4()),
+            ],
+        )
 
-    allowed = int(result[0])
-    retry_after = int(result[1])
+        allowed = int(result[0])
+        retry_after = int(result[1])
+
+    except Exception:
+        # Fail visibly instead of silently disabling
+        # rate limiting when Redis is unavailable.
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": "Rate limiter temporarily unavailable"
+            },
+        )
 
     if not allowed:
         return JSONResponse(
@@ -183,7 +183,7 @@ async def rate_limit_middleware(
                 "detail": "Rate limit exceeded"
             },
             headers={
-                "Retry-After": str(retry_after)
+                "Retry-After": str(retry_after),
             },
         )
 
@@ -191,10 +191,10 @@ async def rate_limit_middleware(
 
 
 # ---------------------------------------
-# Idempotent Order Creation
+# Idempotent POST /orders
 # ---------------------------------------
 
-@app.post("/orders", status_code=201)
+@api.post("/orders", status_code=201)
 def create_order(
     order: OrderRequest,
     idempotency_key: str = Header(
@@ -202,8 +202,14 @@ def create_order(
         alias="Idempotency-Key",
     ),
 ):
+    if not idempotency_key.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Idempotency-Key cannot be empty",
+        )
+
     key_hash = hashlib.sha256(
-        idempotency_key.encode()
+        idempotency_key.encode("utf-8")
     ).hexdigest()
 
     redis_key = f"orders:idempotency:{key_hash}"
@@ -214,16 +220,21 @@ def create_order(
         "quantity": order.quantity,
     }
 
-    # Only the first request can create the record.
-    created = db.set(
-        redis_key,
-        json.dumps(new_order),
-        nx=True,
-    )
+    try:
+        # Atomic SET NX prevents duplicate orders.
+        db.set(
+            redis_key,
+            json.dumps(new_order),
+            nx=True,
+        )
 
-    # Read the stored result for both new and
-    # repeated requests.
-    stored = db.get(redis_key)
+        stored = db.get(redis_key)
+
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail="Order storage unavailable",
+        )
 
     if stored is None:
         raise HTTPException(
@@ -231,11 +242,12 @@ def create_order(
             detail="Unable to retrieve order",
         )
 
+    # Always return the originally stored response.
     return json.loads(stored)
 
 
 # ---------------------------------------
-# Cursor Encoding
+# Cursor Encoding / Decoding
 # ---------------------------------------
 
 def encode_cursor(position: int) -> str:
@@ -252,8 +264,8 @@ def decode_cursor(cursor: str) -> int:
 
         position = int(decoded)
 
-        if position < 0 or position > TOTAL_ORDERS:
-            raise ValueError("Invalid position")
+        if not 0 <= position <= TOTAL_ORDERS:
+            raise ValueError("Invalid cursor position")
 
         return position
 
@@ -265,10 +277,10 @@ def decode_cursor(cursor: str) -> int:
 
 
 # ---------------------------------------
-# Cursor-Based Pagination
+# GET /orders - Cursor Pagination
 # ---------------------------------------
 
-@app.get("/orders")
+@api.get("/orders")
 def list_orders(
     limit: int = Query(
         default=10,
@@ -278,7 +290,7 @@ def list_orders(
 ):
     start = (
         decode_cursor(cursor)
-        if cursor
+        if cursor is not None
         else 0
     )
 
@@ -305,7 +317,7 @@ def list_orders(
 # Health Check
 # ---------------------------------------
 
-@app.get("/")
+@api.get("/")
 def home():
     return {
         "status": "ok",
@@ -314,3 +326,21 @@ def home():
         "rate_limit": RATE_LIMIT,
         "window_seconds": WINDOW_SECONDS,
     }
+
+
+# ---------------------------------------
+# CORS - Outermost Application Wrapper
+# ---------------------------------------
+
+# Wrapping the entire application ensures CORS
+# headers are applied to normal responses,
+# rate-limit errors, and unhandled exceptions.
+
+app = CORSMiddleware(
+    app=api,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["Retry-After"],
+)
